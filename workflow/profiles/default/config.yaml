@@ -1,0 +1,12 @@
+default-resources:
+  mem: 8GB
+  mem_mb: 8000
+software-deployment-method:
+  - conda
+printshellcmds: True
+rerun-incomplete: True
+show-failed-logs: True
+rerun-triggers: mtime
+restart-times: 1
+scheduler: greedy
+scheduler-subsample: 200

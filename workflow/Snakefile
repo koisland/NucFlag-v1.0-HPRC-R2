@@ -1,0 +1,125 @@
+import polars as pl
+from os.path import join
+from collections import defaultdict
+
+
+OUTPUT_DIR = "results"
+LOG_DIR = "logs"
+BMK_DIR = "benchmarks"
+ASM_MANIFEST = "data/assemblies_release2_v1.0.index.csv.gz"
+HIFI_MANIFEST = "data/flagger_hifi_processing_metadata_v0.1.csv.gz"
+ONT_MANIFEST = "data/flagger_ont_processing_metadata_v0.1.csv.gz"
+OMIT_SAMPLES = ("HG002", "GRCh38", "CHM13")
+
+assemblies = defaultdict(list)
+for sm, asm in pl.read_csv(ASM_MANIFEST).filter(~pl.col("sample_id").is_in(OMIT_SAMPLES)).select("sample_id", "assembly").iter_rows():
+    assemblies[sm].append(asm)
+
+URIS = {
+    "asm": assemblies,
+    "hifi": dict(pl.read_csv(HIFI_MANIFEST).select("sample_id", "bam").iter_rows()),
+    "ont": dict(pl.read_csv(ONT_MANIFEST).select("sample_id", "bam").iter_rows())
+}
+SAMPLES = URIS["asm"].keys()
+DATATYPES = ("hifi", "ont")
+PILEUP_TYPES = (
+    "cov",
+    "mismatch",
+    "mapq",
+    "insertion",
+    "deletion",
+    "softclip",
+    "ident",
+)
+
+rule download_assemblies:
+    output:
+        asm=join(OUTPUT_DIR, "data", "{sm}.fa.gz"),
+        asm_fai=join(OUTPUT_DIR, "data", "{sm}fa.gz.fai"),
+    params:
+        uris=lambda wc: URIS["asm"][wc.sm],
+    conda:
+        "envs/tools.yaml"
+    shell:
+        """
+        for uri in {params.uris}; do
+            aws s3 --no-sign-request cp "${{uri}}" - | zcat | bgzip >> {output.asm}
+        done
+        samtools faidx {output.asm}
+        """
+
+
+rule download_bams:
+    output:
+        bam=join(OUTPUT_DIR, "data", "{sm}_{dtype}.bam"),
+        bai=join(OUTPUT_DIR, "data", "{sm}_{dtype}.bam.bai"),
+    params:
+        uri=lambda wc: URIS[wc.dtype][wc.sm]
+    conda:
+        "envs/tools.yaml"
+    shell:
+        """
+        aws s3 cp {params.uri} {output.bam}
+        aws s3 cp {params.uri}.bai {output.bai}
+        """
+
+
+rule run_nucflag:
+    input:
+        bam=rules.download_bams.output.bam,
+        bai=rules.download_bams.output.bai,
+        asm=rules.download_assemblies.output.asm,
+        asm_fai=rules.download_assemblies.output.asm_fai,
+    output:
+        calls=join(OUTPUT_DIR, "nucflag", "{sm}_{dtype}.bed"),
+        status=join(OUTPUT_DIR, "nucflag", "{sm}_{dtype}.status.bed"),
+        plot_dir=directory(join(OUTPUT_DIR, "nucflag", "{sm}_{dtype}_plot")),
+        pileup_dir=directory(join(OUTPUT_DIR, "nucflag", "{sm}_{dtype}_pileup")),
+        qv=join(OUTPUT_DIR, "nucflag", "{sm}_{dtype}.qv.bed"),
+    threads: 12
+    log:
+        join(LOG_DIR, "nucflag", "{sm}_{dtype}.log")
+    benchmark:
+        join(BMK_DIR, "nucflag", "{sm}_{dtype}.log")
+    conda:
+        "envs/tools.yaml"
+    params:
+        preset=lambda wc: "ont_r9" if wc.dtype == "ont" else wc.dtype,
+        pileup_types=" ".join(PILEUP_TYPES),
+    shell:
+        """
+        nucflag call \
+        -p {threads} \
+        -i {input.bam} \
+        -f {input.asm} \
+        -x {params.preset} \
+        -o {output.calls} \
+        -s {output.status} \
+        --output_plot_dir {output.plot_dir} \
+        --output_pileup_dir {output.pileup_dir} \
+        --add_pileup_data {params.pileup_types} \
+        --add_builtin_tracks mapq ident
+        nucflag qv -i {output.calls} > {output.qv}
+        """
+
+rule merge_pileups:
+    input:
+        pileup_dir=rules.run_nucflag.output.pileup_dir,
+    output:
+        bw=join(OUTPUT_DIR, "nucflag", "{sm}_{dtype}_bw", "{ptype}.bw"),
+    conda:
+        "envs/tools.yaml"
+    threads: 8
+    shell:
+        """
+        bigwigmerge -l <(find {input.pileup_dir} -name "*_{wildcards.ptype}.bw") {output.bw}
+        """        
+
+rule all:
+    input:
+        expand(rules.download_assemblies.output, sm=SAMPLES),
+        expand(rules.download_bams.output, sm=SAMPLES, dtype=DATATYPES),
+        expand(rules.run_nucflag.output, sm=SAMPLES, dtype=DATATYPES),
+        expand(rules.merge_pileups.output, sm=SAMPLES, dtype=DATATYPES, ptype=PILEUP_TYPES),
+    default_target:
+        True
