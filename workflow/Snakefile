@@ -35,7 +35,7 @@ PILEUP_TYPES = (
 rule download_assemblies:
     output:
         asm=join(OUTPUT_DIR, "data", "{sm}.fa.gz"),
-        asm_fai=join(OUTPUT_DIR, "data", "{sm}fa.gz.fai"),
+        asm_fai=join(OUTPUT_DIR, "data", "{sm}.fa.gz.fai"),
     params:
         uris=lambda wc: URIS["asm"][wc.sm],
     conda:
@@ -98,8 +98,8 @@ rule run_nucflag:
         --output_plot_dir {output.plot_dir} \
         --output_pileup_dir {output.pileup_dir} \
         --add_pileup_data {params.pileup_types} \
-        --add_builtin_tracks mapq ident
-        nucflag qv -i {output.calls} > {output.qv}
+        --add_builtin_tracks mapq ident 2> {log}
+        nucflag qv -i {output.calls} > {output.qv} 2>> {log}
         """
 
 rule merge_pileups:
