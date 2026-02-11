@@ -1,5 +1,5 @@
 import polars as pl
-from os.path import join
+from os.path import join, dirname
 from collections import defaultdict
 
 
@@ -21,6 +21,7 @@ URIS = {
     "ont": dict(pl.read_csv(ONT_MANIFEST).select("sample_id", "bam").iter_rows())
 }
 SAMPLES = URIS["asm"].keys()
+HAPS = ("1", "2")
 DATATYPES = ("hifi", "ont")
 PILEUP_TYPES = (
     "cov",
@@ -32,9 +33,16 @@ PILEUP_TYPES = (
     "ident",
 )
 
+
+wildcard_constraints:
+    sm="|".join(SAMPLES),
+    dtype="|".join(DATATYPES),
+    ptype="|".join(PILEUP_TYPES),
+
+
 rule download_assemblies:
     output:
-        asm=join(OUTPUT_DIR, "data", "{sm}.fa.gz"),
+        asm=temp(join(OUTPUT_DIR, "data", "{sm}.fa.gz")),
         asm_fai=join(OUTPUT_DIR, "data", "{sm}.fa.gz.fai"),
     params:
         uris=lambda wc: URIS["asm"][wc.sm],
@@ -51,8 +59,8 @@ rule download_assemblies:
 
 rule download_bams:
     output:
-        bam=join(OUTPUT_DIR, "data", "{sm}_{dtype}.bam"),
-        bai=join(OUTPUT_DIR, "data", "{sm}_{dtype}.bam.bai"),
+        bam=temp(join(OUTPUT_DIR, "data", "{sm}_{dtype}.bam")),
+        bai=temp(join(OUTPUT_DIR, "data", "{sm}_{dtype}.bam.bai")),
     params:
         uri=lambda wc: URIS[wc.dtype][wc.sm]
     conda:
@@ -72,10 +80,8 @@ rule run_nucflag:
         asm_fai=rules.download_assemblies.output.asm_fai,
     output:
         calls=join(OUTPUT_DIR, "nucflag", "{sm}_{dtype}.bed"),
-        status=join(OUTPUT_DIR, "nucflag", "{sm}_{dtype}.status.bed"),
-        plot_dir=directory(join(OUTPUT_DIR, "nucflag", "{sm}_{dtype}_plot")),
-        pileup_dir=directory(join(OUTPUT_DIR, "nucflag", "{sm}_{dtype}_pileup")),
-        qv=join(OUTPUT_DIR, "nucflag", "{sm}_{dtype}.qv.bed"),
+        plot_dir=temp(directory(join(OUTPUT_DIR, "nucflag", "{sm}_{dtype}_plot"))),
+        pileup_dir=temp(directory(join(OUTPUT_DIR, "nucflag", "{sm}_{dtype}_pileup"))),
     threads: 12
     log:
         join(LOG_DIR, "nucflag", "{sm}_{dtype}.log")
@@ -94,32 +100,117 @@ rule run_nucflag:
         -f {input.asm} \
         -x {params.preset} \
         -o {output.calls} \
-        -s {output.status} \
         --output_plot_dir {output.plot_dir} \
         --output_pileup_dir {output.pileup_dir} \
         --add_pileup_data {params.pileup_types} \
         --add_builtin_tracks mapq ident 2> {log}
-        nucflag qv -i {output.calls} > {output.qv} 2>> {log}
+        """
+
+
+# Tarball plots by hap
+rule create_plot_tarball:
+    input:
+        plot_dir=rules.run_nucflag.output.plot_dir
+    output:
+        tarball=join(OUTPUT_DIR, "nucflag", "{sm}_{dtype}_{hap}_plots.tar.gz"),
+    params:
+        pattern_hap="#{hap}#"
+    shell:
+        """
+        tar -czf {output.tarball} {input.plot_dir}/*{params.pattern_hap}*.png
+        """
+    
+
+# Bug in v1.0.0-a2 where last interval in whole-genome runs have +1 start. Fixed in v1.0.0-a3
+# Fix by haps. Then pass to rest.
+rule fix_calls:
+    input:
+        calls=rules.run_nucflag.output.calls
+    output:
+        calls=join(OUTPUT_DIR, "nucflag", "{sm}_{dtype}_{hap}_final.bed"),
+    conda:
+        "envs/tools.yaml"
+    params:
+        script="workflow/scripts/fix_v1.0.0-a2_st_coordinate.py",
+        pattern_hap="#{hap}#"
+    shell:
+        """
+        python {params.script} <(grep -P "{params.pattern_hap}|#chrom" {input.calls}) > {output.calls}
+        """
+
+
+rule get_qv_and_status:
+    input:
+        calls=rules.fix_calls.output.calls
+    output:
+        status=join(OUTPUT_DIR, "nucflag", "{sm}_{dtype}_{hap}.status.bed"),
+        qv=join(OUTPUT_DIR, "nucflag", "{sm}_{dtype}_{hap}.qv.bed"),
+    conda:
+        "envs/tools.yaml"
+    shell:
+        """
+        nucflag status -i {input.calls} -o {output.status}
+        nucflag qv -i {input.calls} > {output.qv}
         """
 
 rule merge_pileups:
     input:
         pileup_dir=rules.run_nucflag.output.pileup_dir,
     output:
-        bw=join(OUTPUT_DIR, "nucflag", "{sm}_{dtype}_bw", "{ptype}.bw"),
+        bw=join(OUTPUT_DIR, "nucflag", "{sm}_{dtype}_{hap}_bw", "{ptype}.bw"),
+    params:
+        pattern_hap="#{hap}#"
     conda:
         "envs/tools.yaml"
     threads: 8
     shell:
         """
-        bigwigmerge -l <(find {input.pileup_dir} -name "*_{wildcards.ptype}.bw") {output.bw}
+        bigwigmerge -l <(find {input.pileup_dir} -name "*{params.pattern_hap}*_{wildcards.ptype}.bw") {output.bw}
         """        
+
+rule finalize_output:
+    input:
+        asm_manifest=ASM_MANIFEST,
+        input_nucflag_dir=join(OUTPUT_DIR, "nucflag"),
+        checkpts=[
+            expand(rules.fix_calls.output, sm=SAMPLES, dtype=DATATYPES, hap=HAPS),
+            expand(rules.get_qv_and_status.output, sm=SAMPLES, dtype=DATATYPES, hap=HAPS),
+            expand(rules.create_plot_tarball.output, sm=SAMPLES, dtype=DATATYPES, hap=HAPS),
+            expand(rules.merge_pileups.output, sm=SAMPLES, dtype=DATATYPES, ptype=PILEUP_TYPES, hap=HAPS),
+        ]
+    output:
+        final_dir=directory(join(OUTPUT_DIR, "final")),
+        manifests=[
+            join(OUTPUT_DIR, f"nucflag_{dtype}_{out_dtype}.csv")
+            for dtype in ("hifi", "ont")
+            for out_dtype in (
+                "bw",
+                "bed",
+                "plots",
+                "bed_qv",
+                "bed_status",
+            )
+        ]
+    threads: 24
+    params:
+        script="workflow/scripts/format_for_hprc_submission.py",
+        output_manifest_dir=lambda wc, output: dirname(output.manifests[0]),
+    shell:
+        """
+        python {params.script} \
+        {input.input_nucflag_dir} \
+        {input.asm_manifest} \
+        {output.final_dir} \
+        {params.output_manifest_dir} \
+        {threads}
+        """
 
 rule all:
     input:
-        expand(rules.download_assemblies.output, sm=SAMPLES),
-        expand(rules.download_bams.output, sm=SAMPLES, dtype=DATATYPES),
-        expand(rules.run_nucflag.output, sm=SAMPLES, dtype=DATATYPES),
-        expand(rules.merge_pileups.output, sm=SAMPLES, dtype=DATATYPES, ptype=PILEUP_TYPES),
+        expand(rules.fix_calls.output, sm=SAMPLES, dtype=DATATYPES, hap=HAPS),
+        expand(rules.get_qv_and_status.output, sm=SAMPLES, dtype=DATATYPES, hap=HAPS),
+        expand(rules.create_plot_tarball.output, sm=SAMPLES, dtype=DATATYPES, hap=HAPS),
+        expand(rules.merge_pileups.output, sm=SAMPLES, dtype=DATATYPES, ptype=PILEUP_TYPES, hap=HAPS),
+        rules.finalize_output.output
     default_target:
         True
