@@ -1,0 +1,9 @@
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - awscli
+  - samtools
+  - pip
+  - pip:
+    - nucflag==1.0.0a5

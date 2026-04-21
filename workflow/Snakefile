@@ -1,5 +1,5 @@
 import polars as pl
-from os.path import join, dirname
+from os.path import join, dirname, basename, splitext
 from collections import defaultdict
 
 
@@ -205,12 +205,15 @@ rule finalize_output:
         {threads}
         """
 
+include: "rules/hg002.smk"
+
 rule all:
     input:
         expand(rules.fix_calls.output, sm=SAMPLES, dtype=DATATYPES, hap=HAPS),
         expand(rules.get_qv_and_status.output, sm=SAMPLES, dtype=DATATYPES, hap=HAPS),
         expand(rules.create_plot_tarball.output, sm=SAMPLES, dtype=DATATYPES, hap=HAPS),
         expand(rules.merge_pileups.output, sm=SAMPLES, dtype=DATATYPES, ptype=PILEUP_TYPES, hap=HAPS),
+        rules.hg002_qc_all.input,
         rules.finalize_output.output
     default_target:
         True
