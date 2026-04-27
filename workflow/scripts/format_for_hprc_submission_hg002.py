@@ -10,14 +10,22 @@ def main():
     fname_hap_fstring = sys.argv[3]
 
     os.makedirs(output_dir, exist_ok=True)
-
-    df_calls = (
-        pl.scan_csv(infile, separator="\t", has_header=True)
-        .with_columns(
-            hap=pl.col("#chrom").str.extract(r"#(?<hap>.+)#")
+    try:
+        df_calls = (
+            pl.scan_csv(infile, separator="\t", has_header=True)
+            .with_columns(
+                hap=pl.col("#chrom").str.extract(r"#(?<hap>.+)#")
+            )
+            .collect()
         )
-        .collect()
-    )
+    except pl.exceptions.ColumnNotFoundError:
+        df_calls = (
+            pl.scan_csv(infile, separator="\t", has_header=False, new_columns=["#chrom", "chromStart", "chromEnd", "name"])
+            .with_columns(
+                hap=pl.col("#chrom").str.extract(r"#(?<hap>.+)#")
+            )
+            .collect()
+        )
     for grp, df_grp in df_calls.partition_by(["hap"], as_dict=True, include_key=False).items():
         hap = grp[0]
         df_grp.write_csv(

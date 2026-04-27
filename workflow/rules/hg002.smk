@@ -17,6 +17,7 @@ S3_OUTPUT_DIRS = {
     "hifi_aligned_bam_diploid": "HG002/assemblies/freeze_2/assembly_pipeline/ncbi_upload/assembly_qc/nucflag/v1.0.0a5_hifi/",
     "ont_r9_aligned_bam_diploid": "HG002/assemblies/freeze_2/assembly_pipeline/ncbi_upload/assembly_qc/nucflag/v1.0.0a5_ont_r9/",
     "ont_r10_aligned_bam_diploid": "HG002/assemblies/freeze_2/assembly_pipeline/ncbi_upload/assembly_qc/nucflag/v1.0.0a5_ont_r10/",
+    "v0.3.3_hifi_aligned_bam_diploid": "HG002/assemblies/freeze_2/assembly_pipeline/ncbi_upload/assembly_qc/nucflag/v0.3.3_hifi/",
 }
 VERSION = "v1.0.0a5"
 
@@ -57,6 +58,29 @@ rule merge_asm_hg002_haps:
         samtools faidx {output.asm}
         """
 
+rule run_nucflag_v033_hg002:
+    input:
+        bam_chkpt=expand(rules.download_hg002_qc_data.output, file_id="hifi_aligned_bam_diploid"),
+    output:
+        calls=join(OUTPUT_DIR, "HG002", "v0.3.3_hifi_aligned_bam_diploid.bed"),
+        plot_dir=directory(join(OUTPUT_DIR, "HG002", "v0.3.3_hifi_aligned_bam_diploid_plot")),
+    threads: 12
+    log:
+        join(LOG_DIR, "HG002", "v0.3.3_hifi_aligned_bam_diploid_plot.log")
+    benchmark:
+        join(BMK_DIR, "HG002", "v0.3.3_hifi_aligned_bam_diploid_plot.log")
+    conda:
+        "../envs/hg002_nf_old.yaml"
+    params:
+        bam=join(OUTPUT_DIR, "HG002", "data", basename(SM_WC_MAP["hifi_aligned_bam_diploid"])),
+    shell:
+        """
+        nucflag \
+        -p {threads} \
+        -i {params.bam} \
+        -o {output.calls} \
+        -d {output.plot_dir} 2> {log}
+        """
 
 rule run_nucflag_hg002:
     input:
@@ -105,6 +129,19 @@ rule prep_data_for_upload:
         python {params.script} {input.calls} {params.output_dir} {params.fname_fstring}
         """
 
+rule prep_v033_data_for_upload:
+    input:
+        calls=rules.run_nucflag_v033_hg002.output.calls
+    output:
+        chkpt=touch(join(OUTPUT_DIR, "final_HG002_v0.3.3_hifi_aligned_bam_diploid_plot.done"))
+    params:
+        script="workflow/scripts/format_for_hprc_submission_hg002.py",
+        output_dir=join(OUTPUT_DIR, "final_HG002", S3_OUTPUT_DIRS["v0.3.3_hifi_aligned_bam_diploid"]),
+        fname_fstring=lambda wc: "HG002_hprc_v2_hifi_aligned_bam_diploid_plot_NucFlag_v0.3.3_hap{hap}"
+    shell:
+        """
+        python {params.script} {input.calls} {params.output_dir} {params.fname_fstring}
+        """
 
 rule hg002_qc_all:
     input:
@@ -115,3 +152,5 @@ rule hg002_qc_all:
             file_id=FILE_IDS_BAM
         ),
         expand(rules.prep_data_for_upload.output, file_id=FILE_IDS_BAM),
+        rules.run_nucflag_v033_hg002.output,
+        rules.prep_v033_data_for_upload.output,
